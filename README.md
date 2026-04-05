@@ -129,7 +129,7 @@ It tries Telegram draft streaming first with `sendMessageDraft`. If that is not 
 
 ## Parallel Mode (Standalone Router)
 
-In addition to the session-local extension above, `pi-telegram-router.ts` provides a **standalone parallel router** that runs without a terminal open and supports multiple concurrent conversation lanes.
+In addition to the session-local extension above, `router.ts` provides a **standalone parallel router** that runs without a terminal open and supports multiple concurrent conversation lanes.
 
 ### How it works
 
@@ -145,14 +145,14 @@ In addition to the session-local extension above, `pi-telegram-router.ts` provid
 3. Run the router:
 
 ```bash
-node /path/to/pi-telegram-router.ts
+node /path/to/router.ts
 ```
 
 Or install it somewhere on your PATH:
 
 ```bash
-cp pi-telegram-router.ts ~/.local/bin/pi-telegram-router.ts
-chmod +x ~/.local/bin/pi-telegram-router.ts
+cp router.ts ~/.local/bin/router.ts
+chmod +x ~/.local/bin/router.ts
 ```
 
 ### Commands
