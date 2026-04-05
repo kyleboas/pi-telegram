@@ -644,7 +644,7 @@ async function handleCommand(msg: TelegramMessage, command: { name: string; args
 		case "start":
 		case "help": {
 			await sendMessage(chatId, [
-				"🤖 *pi Telegram Bridge (parallel mode)*",
+				"*pi Telegram Bridge (parallel mode)*",
 				"",
 				"/new — Start a new conversation lane",
 				"/help — Show this help",
@@ -661,9 +661,9 @@ async function handleCommand(msg: TelegramMessage, command: { name: string; args
 
 		case "status": {
 			const registry = await loadRegistry();
-			const lines = [`📡 *Active lanes: ${lanes.size}*`];
+			const lines = [`*Active lanes: ${lanes.size}*`];
 			for (const [key, lane] of lanes) {
-				const alive = lane.worker.isAlive ? "✅" : "❌";
+				const alive = lane.worker.isAlive ? "[alive]" : "[dead]";
 				lines.push(`${alive} Lane \`${key}\`${lane.label ? ` (${lane.label})` : ""}`);
 			}
 			if (lanes.size === 0) lines.push("_No active lanes. Send a message to start the default lane._");
