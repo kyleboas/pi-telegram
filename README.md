@@ -127,9 +127,64 @@ The extension streams assistant text previews back to Telegram while pi is gener
 
 It tries Telegram draft streaming first with `sendMessageDraft`. If that is not supported for your bot, it falls back to `sendMessage` plus `editMessageText`.
 
+## Parallel Mode (Standalone Router)
+
+In addition to the session-local extension above, `pi-telegram-router.ts` provides a **standalone parallel router** that runs without a terminal open and supports multiple concurrent conversation lanes.
+
+### How it works
+
+- One Node.js process polls Telegram and manages worker lanes.
+- Each lane is a separate `pi --mode rpc` child process.
+- `/new` starts a new lane and posts an anchor message. Reply to any anchor to route to that lane's conversation.
+- All lanes process in true parallel — no terminal or TUI needed.
+
+### Setup
+
+1. Ensure `pi` is installed at `/usr/bin/pi` (or edit `PI_BIN` in the script).
+2. Configure `~/.pi/agent/telegram.json` with your bot token (same config as the extension).
+3. Run the router:
+
+```bash
+node /path/to/pi-telegram-router.ts
+```
+
+Or install it somewhere on your PATH:
+
+```bash
+cp pi-telegram-router.ts ~/.local/bin/pi-telegram-router.ts
+chmod +x ~/.local/bin/pi-telegram-router.ts
+```
+
+### Commands
+
+| Command     | Description                                      |
+|-------------|--------------------------------------------------|
+| `/new`      | Start a new conversation lane                    |
+| `/status`   | Show active lanes                                |
+| `/stop`     | Abort current turn in the default lane           |
+| `/compact`  | Compact context in the default lane              |
+| `/model`    | Cycle model in the default lane                  |
+| `/help`     | Show help                                        |
+
+### Features
+
+- **Parallel lanes**: Multiple independent pi conversations at once
+- **Persistent sessions**: Lanes survive restarts via `telegram-lanes.json` registry
+- **Media support**: Photos, image documents, and media groups (albums)
+- **Streaming**: Typing indicators while the agent is generating
+- **Auto-restart**: Default lane worker is restarted automatically if it dies
+
+### Notes
+
+- The router and the extension should not be used simultaneously with the same bot.
+- Lane state is persisted in `~/.pi/agent/telegram-lanes.json`.
+- Debug logs go to `~/.pi/agent/telegram-parallel-debug.log`.
+
+---
+
 ## Notes
 
-- Only one pi session should be connected to the bot at a time
+- Only one pi session should be connected to the bot at a time (extension mode)
 - Replies are sent as normal Telegram messages, not quote-replies
 - Long replies are split below Telegram's 4096 character limit
 - Outbound files are sent via `telegram_attach`
