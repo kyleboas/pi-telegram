@@ -123,8 +123,6 @@ If you send more Telegram messages while pi is busy, they are queued and process
 
 ## Streaming
 
-The extension streams assistant text previews back to Telegram while pi is generating.
-
 It tries Telegram draft streaming first with `sendMessageDraft`. If that is not supported for your bot, it falls back to `sendMessage` plus `editMessageText`.
 
 ## Parallel Mode (Standalone Router)
@@ -176,16 +174,12 @@ chmod +x ~/.local/bin/router.ts
 
 ### Notes
 
-- The router and the extension should not be used simultaneously with the same bot.
 - Lane state is persisted in `~/.pi/agent/telegram-lanes.json`.
 - Debug logs go to `~/.pi/agent/telegram-parallel-debug.log`.
 
 ---
 
 ## Notes
-
-- Only one pi session should be connected to the bot at a time (extension mode)
-- Replies are sent as normal Telegram messages, not quote-replies
 - Long replies are split below Telegram's 4096 character limit
 - Outbound files are sent via `telegram_attach`
 
