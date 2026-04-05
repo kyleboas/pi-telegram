@@ -282,6 +282,10 @@ async function readConfig(): Promise<TelegramConfig> {
 async function writeConfig(config: TelegramConfig): Promise<void> {
 	await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
 	await writeFile(CONFIG_PATH, JSON.stringify(config, null, "\t") + "\n", "utf8");
+	try {
+		const { chmod } = await import("node:fs/promises");
+		await chmod(CONFIG_PATH, 0o600);
+	} catch (_e) { /* ignore */ }
 }
 
 export default function (pi: ExtensionAPI) {
@@ -297,6 +301,10 @@ export default function (pi: ExtensionAPI) {
 	let previewState: TelegramPreviewState | undefined;
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
+	let setupPairingExpiry: number | undefined;
+	const RATE_WINDOW_MS = 60_000; // 1 minute
+	const MAX_RATE_MESSAGES = 10;
+	const rateLimitBuckets = new Map<number, number[]>();
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 
 	function allocateDraftId(): number {
@@ -384,7 +392,15 @@ export default function (pi: ExtensionAPI) {
 		const targetPath = join(TEMP_DIR, `${Date.now()}-${sanitizeFileName(suggestedName)}`);
 		const response = await fetch(`https://api.telegram.org/file/bot${config.botToken}/${file.file_path}`);
 		if (!response.ok) throw new Error(`Failed to download Telegram file: ${response.status}`);
+		const contentLength = parseInt(response.headers.get("content-length") ?? "0", 10);
+		const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024; // 20 MB
+		if (contentLength > MAX_DOWNLOAD_BYTES) {
+			throw new Error(`File exceeds ${MAX_DOWNLOAD_BYTES / 1024 / 1024} MB limit`);
+		}
 		const arrayBuffer = await response.arrayBuffer();
+		if (arrayBuffer.byteLength > MAX_DOWNLOAD_BYTES) {
+			throw new Error(`File exceeds ${MAX_DOWNLOAD_BYTES / 1024 / 1024} MB limit`);
+		}
 		await writeFile(targetPath, Buffer.from(arrayBuffer));
 		return targetPath;
 	}
@@ -656,8 +672,9 @@ export default function (pi: ExtensionAPI) {
 			nextConfig.botUsername = data.result.username;
 			config = nextConfig;
 			await writeConfig(config);
+			setupPairingExpiry = Date.now() + 5 * 60 * 1000; // 5 minute pairing window
 			ctx.ui.notify(`Telegram bot connected: @${config.botUsername ?? "unknown"}`, "info");
-			ctx.ui.notify("Send /start to your bot in Telegram to pair this extension with your account.", "info");
+			ctx.ui.notify("Send /start to your bot in Telegram within 5 minutes to pair this extension with your account.", "info");
 			await startPolling(ctx);
 			updateStatus(ctx);
 		} finally {
@@ -869,6 +886,11 @@ export default function (pi: ExtensionAPI) {
 		if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot) return;
 
 		if (config.allowedUserId === undefined) {
+			// Only allow pairing within 5 minutes of setup
+			if (setupPairingExpiry && Date.now() > setupPairingExpiry) {
+				await sendTextReply(message.chat.id, message.message_id, "Pairing window expired. Run /telegram-setup again in pi.");
+				return;
+			}
 			config.allowedUserId = message.from.id;
 			await writeConfig(config);
 			updateStatus(ctx);
@@ -879,6 +901,16 @@ export default function (pi: ExtensionAPI) {
 			await sendTextReply(message.chat.id, message.message_id, "This bot is not authorized for your account.");
 			return;
 		}
+
+		// Rate limiting
+		const now = Date.now();
+		const userTimes = rateLimitBuckets.get(message.from.id) ?? [];
+		const recent = userTimes.filter((t) => now - t < RATE_WINDOW_MS);
+		if (recent.length >= MAX_RATE_MESSAGES) {
+			return;
+		}
+		recent.push(now);
+		rateLimitBuckets.set(message.from.id, recent);
 
 		await handleAuthorizedTelegramMessage(message, ctx);
 	}
