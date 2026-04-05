@@ -9,10 +9,6 @@
  *   - /new spawns a new worker lane and returns an anchor message.
  *   - Replying to an anchor message routes to that lane's worker.
  *   - Multiple lanes process in true parallel.
- *
- * Usage:
- *   node /home/kyle/.local/bin/pi-telegram-router
- */
 
 import { ChildProcess, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
