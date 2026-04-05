@@ -9,11 +9,15 @@
  *   - /new spawns a new worker lane and returns an anchor message.
  *   - Replying to an anchor message routes to that lane's worker.
  *   - Multiple lanes process in true parallel.
+ *
+ * Usage:
+ *   node /home/kyle/.local/bin/pi-telegram-router
+ */
 
 import { ChildProcess, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { extname, join } from "node:path";
+import { extname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { request as httpsRequest } from "node:https";
 
@@ -112,6 +116,11 @@ const MAX_MESSAGE_LENGTH = 4096;
 const MEDIA_GROUP_DEBOUNCE_MS = 1200;
 const POLL_TIMEOUT_SEC = 30;
 const PI_BIN = "/usr/bin/pi";
+const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024; // 20 MB
+const MAX_LANES = 20;
+const MAX_MESSAGE_TO_LANE_ENTRIES = 1000;
+const MAX_RATE_MESSAGES = 10; // per window
+const RATE_WINDOW_MS = 60_000; // 1 minute
 
 // ─── Lane Registry (persistence) ────────────────────────────────────────────
 
@@ -316,9 +325,24 @@ async function downloadFile(fileId: string, fileName: string): Promise<string> {
 	const dest = join(TEMP_DIR, fileName);
 	return new Promise((resolve, reject) => {
 		httpsRequest(url, (res) => {
+			if (res.statusCode && res.statusCode >= 400) {
+				res.resume();
+				return reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+			}
 			const chunks: Buffer[] = [];
-			res.on("data", (c: Buffer) => chunks.push(c));
+			let totalBytes = 0;
+			res.on("data", (c: Buffer) => {
+				totalBytes += c.length;
+				if (totalBytes > MAX_DOWNLOAD_BYTES) {
+					res.destroy();
+					return reject(new Error(`File exceeds ${MAX_DOWNLOAD_BYTES / 1024 / 1024} MB limit`));
+				}
+				chunks.push(c);
+			});
 			res.on("end", async () => {
+				if (totalBytes > MAX_DOWNLOAD_BYTES) {
+					return reject(new Error(`File exceeds ${MAX_DOWNLOAD_BYTES / 1024 / 1024} MB limit`));
+				}
 				await writeFile(dest, Buffer.concat(chunks));
 				resolve(dest);
 			});
@@ -344,7 +368,7 @@ async function log(msg: string): Promise<void> {
 	try {
 		await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
 		await appendFile(DEBUG_LOG_PATH, `[${new Date().toISOString()}] ${msg}\n`, "utf8");
-	} catch { /* ignore */ }
+	} catch (_e) { /* ignore */ }
 }
 
 function chunkText(text: string): string[] {
@@ -379,7 +403,12 @@ function guessMediaType(path: string): string | undefined {
 }
 
 function sanitizeFileName(name: string): string {
-	return name.replace(/[^a-zA-Z0-9._-]+/g, "_");
+	return name
+		.replace(/\.+/g, ".")          // collapse dot sequences
+		.replace(/[^a-zA-Z0-9._-]+/g, "_")
+		.replace(/^[-_.]+/, "")         // strip leading special chars
+		.slice(0, 255)                  // limit length
+		|| "file";                      // fallback if empty
 }
 
 // ─── Lane Manager ───────────────────────────────────────────────────────────
@@ -401,41 +430,82 @@ async function loadRegistry(): Promise<LaneRegistry> {
 async function saveRegistry(registry: LaneRegistry): Promise<void> {
 	await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
 	await writeFile(REGISTRY_PATH, JSON.stringify(registry, null, "\t") + "\n", "utf8");
+	try {
+		const { chmod } = await import("node:fs/promises");
+		await chmod(REGISTRY_PATH, 0o600);
+	} catch (_e) { /* ignore */ }
 }
+
+function isValidSessionFile(path: string | undefined): boolean {
+	if (!path) return false;
+	const resolved = resolve(path);
+	const agentDir = join(homedir(), ".pi", "agent");
+	return resolved.startsWith(agentDir + sep) || resolved === agentDir;
+}
+
+const laneCreationLocks = new Set<string>();
 
 async function getOrCreateLane(laneKey: string, chatId: number, replyToMessageId: number): Promise<LaneInfo> {
 	const existing = lanes.get(laneKey);
 	if (existing && existing.worker.isAlive) return existing;
 
-	// Check registry for existing session file to resume
-	const registry = await loadRegistry();
-	const existingSession = registry.lanes[laneKey]?.sessionFile;
-
-	await log(`Creating new worker lane: ${laneKey}${existingSession ? ` (resuming session ${existingSession})` : ""}`);
-	const worker = new PiWorker(laneKey);
-	await worker.start(existingSession);
-
-	// Record session file
-	const state = await worker.sendCommand("get_state", {});
-	const sessionFile = state.data?.sessionFile as string | undefined;
-
-	// Set up event listener to collect responses
-	setupWorkerEvents(worker);
-
-	const lane: LaneInfo = { laneKey, worker, createdAt: new Date() };
-	lanes.set(laneKey, lane);
-
-	// Persist
-	if (laneKey !== "default") {
-		registry.lanes[laneKey] = {
-			anchorMessageId: parseInt(laneKey, 10),
-			sessionFile,
-			createdAt: new Date().toISOString(),
-		};
+	// Guard against concurrent creation for the same key
+	if (laneCreationLocks.has(laneKey)) {
+		throw new Error(`Lane ${laneKey} is being created, please retry`);
 	}
-	await saveRegistry(registry);
+	if (lanes.size >= MAX_LANES) {
+		throw new Error(`Maximum number of lanes (${MAX_LANES}) reached`);
+	}
 
-	return lane;
+	laneCreationLocks.add(laneKey);
+	try {
+		// Re-check after acquiring lock
+		const recheck = lanes.get(laneKey);
+		if (recheck && recheck.worker.isAlive) return recheck;
+
+		// Check registry for existing session file to resume
+		const registry = await loadRegistry();
+		const existingSession = registry.lanes[laneKey]?.sessionFile;
+
+		if (existingSession && !isValidSessionFile(existingSession)) {
+			await log(`Invalid session file path rejected: ${existingSession}`);
+			throw new Error("Invalid session file path");
+		}
+
+		await log(`Creating new worker lane: ${laneKey}${existingSession ? ` (resuming session)` : ""}`);
+		const worker = new PiWorker(laneKey);
+		await worker.start(existingSession);
+
+		// Record session file
+		const state = await worker.sendCommand("get_state", {});
+		const sessionFile = state.data?.sessionFile as string | undefined;
+
+		if (sessionFile && !isValidSessionFile(sessionFile)) {
+			await log(`RPC returned invalid session path: ${sessionFile}`);
+			await worker.stop();
+			throw new Error("Invalid session file from worker");
+		}
+
+		// Set up event listener to collect responses
+		setupWorkerEvents(worker);
+
+		const lane: LaneInfo = { laneKey, worker, createdAt: new Date() };
+		lanes.set(laneKey, lane);
+
+		// Persist
+		if (laneKey !== "default") {
+			registry.lanes[laneKey] = {
+				anchorMessageId: parseInt(laneKey, 10),
+				sessionFile,
+				createdAt: new Date().toISOString(),
+			};
+		}
+		await saveRegistry(registry);
+
+		return lane;
+	} finally {
+		laneCreationLocks.delete(laneKey);
+	}
 }
 
 async function createNewLane(chatId: number, replyToMessageId: number): Promise<{ lane: LaneInfo; anchorMessageId: number }> {
@@ -484,10 +554,21 @@ async function createNewLane(chatId: number, replyToMessageId: number): Promise<
 // Track pending prompt reply targets per worker
 const workerReplyTargets = new Map<string, { chatId: number; replyToMessageId: number }[]>();
 
+function trimMap<K, V>(map: Map<K, V>, maxSize: number): void {
+	if (map.size <= maxSize) return;
+	const iter = map.keys();
+	while (map.size > maxSize) {
+		const r = iter.next();
+		if (r.done) break;
+		map.delete(r.value);
+	}
+}
+
 function pushReplyTarget(laneKey: string, chatId: number, replyToMessageId: number): void {
 	let targets = workerReplyTargets.get(laneKey);
 	if (!targets) { targets = []; workerReplyTargets.set(laneKey, targets); }
 	targets.push({ chatId, replyToMessageId });
+	trimMap(messageToLane, MAX_MESSAGE_TO_LANE_ENTRIES);
 }
 
 function popReplyTarget(laneKey: string): { chatId: number; replyToMessageId: number } | undefined {
@@ -726,13 +807,31 @@ async function handleTelegramMessage(msg: TelegramMessage): Promise<void> {
 		return;
 	}
 
+	// Rate limiting
+	const now = Date.now();
+	const userTimes = rateLimitBuckets.get(msg.from.id) ?? [];
+	const recent = userTimes.filter((t) => now - t < RATE_WINDOW_MS);
+	if (recent.length >= MAX_RATE_MESSAGES) {
+		await log(`Rate limited user: ${msg.from.id}`);
+		return;
+	}
+	recent.push(now);
+	rateLimitBuckets.set(msg.from.id, recent);
+
 	const chatId = msg.chat.id;
 	const text = (msg.text ?? msg.caption ?? "").trim();
 
 	await log(`message from=${msg.from.id} text=${JSON.stringify(text.slice(0, 100))}`);
 
+	// Reject unsupported media types
+	const unsupportedMedia = !!(msg.video || msg.audio || msg.voice || msg.animation || msg.sticker);
+	if (unsupportedMedia) {
+		await sendMessage(chatId, "Unsupported media type. Please send text, images, or image files.", msg.message_id);
+		return;
+	}
+
 	// Check if text-only (no photos/documents)
-	const hasMedia = !!(msg.photo?.length || msg.document || msg.video || msg.audio || msg.voice || msg.animation || msg.sticker);
+	const hasMedia = !!(msg.photo?.length || msg.document);
 
 	// Handle media groups (album of photos)
 	if (msg.media_group_id) {
@@ -830,6 +929,8 @@ async function handleMediaGroup(messages: TelegramMessage[]): Promise<void> {
 
 // ─── Main Loop ──────────────────────────────────────────────────────────────
 
+const rateLimitBuckets = new Map<number, number[]>();
+
 async function main(): Promise<void> {
 	await log("=== pi-telegram-router starting ===");
 
@@ -839,6 +940,13 @@ async function main(): Promise<void> {
 		console.error("No bot token in telegram.json");
 		process.exit(1);
 	}
+
+	// Restrict config file permissions
+	try {
+		const { chmod } = await import("node:fs/promises");
+		await chmod(CONFIG_PATH, 0o600);
+		await chmod(REGISTRY_PATH, 0o600).catch(() => {});
+	} catch (_e) { /* ignore */ }
 
 	// Restore lanes from registry
 	const registry = await loadRegistry();
