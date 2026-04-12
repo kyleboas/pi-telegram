@@ -128,6 +128,7 @@ interface PendingTelegramTurn {
 	queuedAttachments: QueuedAttachment[];
 	content: Array<TextContent | ImageContent>;
 	historyText: string;
+	usageLimitRetries?: number;
 }
 
 type ActiveTelegramTurn = PendingTelegramTurn;
@@ -159,6 +160,9 @@ const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
+
+// Track models disabled due to rate limits: model key -> expiry timestamp
+const disabledModels = new Map<string, number>();
 
 const SYSTEM_PROMPT_SUFFIX = `
 
@@ -267,6 +271,271 @@ function chunkParagraphs(text: string): string[] {
 	}
 	flushCurrent();
 	return chunks;
+}
+
+function roundUsd(value: number): number {
+	return Math.round(value * 10000) / 10000;
+}
+
+function formatUsd(value: number): string {
+	return value < 0.0001 && value > 0 ? "<$0.0001" : `$${value.toFixed(4)}`;
+}
+
+function estimateRateCost(units: number, perMillionUsd: number): number {
+	return roundUsd((units / 1_000_000) * perMillionUsd);
+}
+
+// Parse duration strings like "~5656 min", "1 hour", "30 seconds" and return milliseconds
+function parseDurationMs(durationStr: string): number {
+	const timeMatch = durationStr.match(/(\d+(?:\.\d+)?)\s*([a-z]+)/i);
+	if (!timeMatch) return 0;
+
+	const value = parseFloat(timeMatch[1]);
+	const unit = timeMatch[2].toLowerCase();
+
+	const unitMap: Record<string, number> = {
+		"ms": 1,
+		"s": 1000,
+		"sec": 1000,
+		"second": 1000,
+		"m": 60 * 1000,
+		"min": 60 * 1000,
+		"minute": 60 * 1000,
+		"h": 60 * 60 * 1000,
+		"hr": 60 * 60 * 1000,
+		"hour": 60 * 60 * 1000,
+		"d": 24 * 60 * 60 * 1000,
+		"day": 24 * 60 * 60 * 1000,
+	};
+
+	const multiplier = unitMap[unit] || 0;
+	return multiplier > 0 ? Math.round(value * multiplier) : 0;
+}
+
+// Get model identifier key
+function getModelKey(provider?: string, modelId?: string): string {
+	return `${provider || "unknown"}/${modelId || "unknown"}`;
+}
+
+// Check if a model is currently disabled due to rate limit
+function isModelDisabled(provider?: string, modelId?: string): boolean {
+	const key = getModelKey(provider, modelId);
+	const expiryTime = disabledModels.get(key);
+	if (!expiryTime) return false;
+
+	if (Date.now() >= expiryTime) {
+		disabledModels.delete(key);
+		return false;
+	}
+	return true;
+}
+
+// Mark a model as disabled for a specified duration
+function disableModelUntil(provider?: string, modelId?: string, durationMs?: number): void {
+	if (!durationMs || durationMs <= 0) return;
+	const key = getModelKey(provider, modelId);
+	const expiryTime = Date.now() + durationMs;
+	disabledModels.set(key, expiryTime);
+}
+
+// Get remaining disabled time in seconds for display
+function getDisabledTimeRemaining(provider?: string, modelId?: string): number {
+	const key = getModelKey(provider, modelId);
+	const expiryTime = disabledModels.get(key);
+	if (!expiryTime) return 0;
+	const remaining = Math.max(0, expiryTime - Date.now());
+	return Math.round(remaining / 1000);
+}
+
+
+async function fetchSpendBreakdown(): Promise<{ day: string; spentUsd: number; dailyLimitUsd: number; sections: Array<{ title: string; items: Array<{ label: string; amountUsd: number }> }> }> {
+	const statusRes = await fetch("https://budget-guard.heyboas.workers.dev/status");
+	if (!statusRes.ok) throw new Error(`Budget Guard returned HTTP ${statusRes.status}`);
+	const state = await statusRes.json() as any;
+	const day = state.currentDay as string;
+
+	const adminToken = await readFile(join(homedir(), "code", "budget-guard", ".admin_token"), "utf8").then((t) => t.trim()).catch(() => "");
+	let events: any[] = [];
+	if (adminToken) {
+		const eventsRes = await fetch(`https://budget-guard.heyboas.workers.dev/admin/events?day=${day}`, {
+			headers: { Authorization: `Bearer ${adminToken}` },
+		});
+		if (eventsRes.ok) {
+			const eventsData = await eventsRes.json() as any;
+			events = eventsData.items || [];
+		}
+	}
+
+	const serviceSummary = events.reduce((acc: Record<string, number>, event: any) => {
+		if (event.type === "record" && typeof event.source === "string" && !event.source.startsWith("cloudflare-")) {
+			acc[event.source] = roundUsd((acc[event.source] || 0) + Number(event.amountUsd || 0));
+		}
+		return acc;
+	}, {});
+
+	const sections: Array<{ title: string; items: Array<{ label: string; amountUsd: number }> }> = [];
+	const serviceItems = Object.entries(serviceSummary)
+		.sort((a, b) => b[1] - a[1])
+		.map(([label, amountUsd]) => ({ label, amountUsd }));
+	if (serviceItems.length > 0) {
+		sections.push({ title: "Service-reported", items: serviceItems });
+	}
+
+	const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+	const apiToken = process.env.CLOUDFLARE_API_TOKEN;
+	if (accountId && apiToken) {
+		const query = `query SpendBreakdown($accountTag: String!, $start: String!, $end: String!) {
+			viewer {
+				accounts(filter: { accountTag: $accountTag }) {
+					aiGatewayRequestsAdaptiveGroups(limit: 200, filter: { datetime_geq: $start, datetime_leq: $end }) {
+						dimensions { gateway provider model }
+						sum { cost }
+					}
+					aiInferenceAdaptiveGroups(limit: 200, filter: { datetime_geq: $start, datetime_leq: $end }) {
+						dimensions { modelId requestSource tag }
+						sum { totalInputTokens totalOutputTokens }
+					}
+					workersInvocationsAdaptive(limit: 200, filter: { datetime_geq: $start, datetime_leq: $end }) {
+						dimensions { scriptName }
+						sum { requests cpuTimeUs }
+					}
+					pagesFunctionsInvocationsAdaptiveGroups(limit: 200, filter: { datetime_geq: $start, datetime_leq: $end }) {
+						dimensions { scriptName }
+						sum { requests duration }
+					}
+					d1AnalyticsAdaptiveGroups(limit: 200, filter: { datetime_geq: $start, datetime_leq: $end }) {
+						dimensions { databaseId }
+						sum { rowsRead rowsWritten }
+					}
+					kvOperationsAdaptiveGroups(limit: 200, filter: { datetime_geq: $start, datetime_leq: $end }) {
+						dimensions { actionType namespaceId }
+						count
+					}
+					vectorizeQueriesAdaptiveGroups(limit: 200, filter: { datetime_geq: $start, datetime_leq: $end }) {
+						dimensions { vectorizeIndexId }
+						sum { queriedVectorDimensions }
+					}
+					vectorizeV2QueriesAdaptiveGroups(limit: 200, filter: { datetime_geq: $start, datetime_leq: $end }) {
+						dimensions { indexName operation }
+						sum { queriedVectorDimensions }
+					}
+				}
+			}
+		}`;
+		const graphqlRes = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${apiToken}`,
+				"Content-Type": "application/json",
+				Accept: "application/json",
+			},
+			body: JSON.stringify({
+				query,
+				variables: { accountTag: accountId, start: `${day}T00:00:00.000Z`, end: `${day}T23:59:59.999Z` },
+			}),
+		});
+		if (graphqlRes.ok) {
+			const graphql = await graphqlRes.json() as any;
+			const account = graphql?.data?.viewer?.accounts?.[0];
+			if (account) {
+				const d1Names: Record<string, string> = {
+					"8e2df5bc-4e61-4fce-bbfd-127c41fac3c1": "secondbrain (D1)",
+					"a40fea6c-9e63-47b3-a697-3598b1fafaa4": "tacticsjournal.com (D1)",
+				};
+				const kvNames: Record<string, string> = {
+					"25f958ce444b49338338bff6de73d0bc": "budget-guard (KV)",
+				};
+				const cloudflareItems: Array<{ label: string; amountUsd: number }> = [];
+
+				for (const row of account.aiGatewayRequestsAdaptiveGroups || []) {
+					const gateway = row?.dimensions?.gateway || "unknown";
+					const provider = row?.dimensions?.provider || "unknown";
+					const model = row?.dimensions?.model || "unknown";
+					const cost = Number(row?.sum?.cost || 0);
+					if (cost > 0) cloudflareItems.push({ label: `${gateway} (AI Gateway · ${provider}/${model})`, amountUsd: roundUsd(cost) });
+				}
+
+				const workersAiPricing: Record<string, { input: number; output: number }> = {
+					"@cf/meta/llama-3.3-70b-instruct-fp8-fast": { input: 0.293, output: 2.253 },
+					"@cf/meta/llama-3.1-8b-instruct-fast": { input: 0.015, output: 0.025 },
+					"@cf/meta/llama-4-scout": { input: 0.12, output: 0.18 },
+					"@cf/baai/bge-base-en-v1.5": { input: 0.012, output: 0 },
+					"@cf/baai/bge-m3": { input: 0.012, output: 0 },
+				};
+				for (const row of account.aiInferenceAdaptiveGroups || []) {
+					const modelId = String(row?.dimensions?.modelId || "unknown");
+					const pricing = workersAiPricing[modelId] || (modelId.includes("bge") ? workersAiPricing["@cf/baai/bge-base-en-v1.5"] : undefined);
+					if (!pricing) continue;
+					const inputTokens = Number(row?.sum?.totalInputTokens || 0);
+					const outputTokens = Number(row?.sum?.totalOutputTokens || 0);
+					const cost = roundUsd((inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output);
+					if (cost > 0) cloudflareItems.push({ label: `Workers AI (${modelId})`, amountUsd: cost });
+				}
+
+				for (const row of account.workersInvocationsAdaptive || []) {
+					const scriptName = row?.dimensions?.scriptName || "unknown worker";
+					const requests = Number(row?.sum?.requests || 0);
+					const cpuMs = Number(row?.sum?.cpuTimeUs || 0) / 1000;
+					const cost = roundUsd(estimateRateCost(requests, 0.30) + estimateRateCost(cpuMs, 0.02));
+					if (cost > 0) cloudflareItems.push({ label: `${scriptName} (Workers)`, amountUsd: cost });
+				}
+
+				for (const row of account.pagesFunctionsInvocationsAdaptiveGroups || []) {
+					const scriptName = row?.dimensions?.scriptName || "unknown pages function";
+					const requests = Number(row?.sum?.requests || 0);
+					const duration = Number(row?.sum?.duration || 0);
+					const cost = roundUsd(estimateRateCost(requests, 0.30) + estimateRateCost(duration, 0.02));
+					if (cost > 0) cloudflareItems.push({ label: `${scriptName} (Pages Functions)`, amountUsd: cost });
+				}
+
+				for (const row of account.d1AnalyticsAdaptiveGroups || []) {
+					const databaseId = String(row?.dimensions?.databaseId || "unknown");
+					const rowsRead = Number(row?.sum?.rowsRead || 0);
+					const rowsWritten = Number(row?.sum?.rowsWritten || 0);
+					const cost = roundUsd(estimateRateCost(rowsRead, 0.001) + estimateRateCost(rowsWritten, 1.0));
+					if (cost > 0) cloudflareItems.push({ label: d1Names[databaseId] || `${databaseId} (D1)`, amountUsd: cost });
+				}
+
+				const kvByNamespace: Record<string, { read: number; writeLike: number }> = {};
+				for (const row of account.kvOperationsAdaptiveGroups || []) {
+					const namespaceId = String(row?.dimensions?.namespaceId || "unknown");
+					const actionType = String(row?.dimensions?.actionType || "other").toLowerCase();
+					const count = Number(row?.count || 0);
+					kvByNamespace[namespaceId] ||= { read: 0, writeLike: 0 };
+					if (actionType === "read") kvByNamespace[namespaceId].read += count;
+					else kvByNamespace[namespaceId].writeLike += count;
+				}
+				for (const [namespaceId, usage] of Object.entries(kvByNamespace)) {
+					const cost = roundUsd(estimateRateCost(usage.read, 0.50) + estimateRateCost(usage.writeLike, 5.0));
+					if (cost > 0) cloudflareItems.push({ label: kvNames[namespaceId] || `${namespaceId} (KV)`, amountUsd: cost });
+				}
+
+				for (const row of account.vectorizeQueriesAdaptiveGroups || []) {
+					const indexId = String(row?.dimensions?.vectorizeIndexId || "unknown");
+					const dims = Number(row?.sum?.queriedVectorDimensions || 0);
+					const cost = roundUsd(estimateRateCost(dims, 0.01));
+					if (cost > 0) cloudflareItems.push({ label: `${indexId} (Vectorize v1)`, amountUsd: cost });
+				}
+				for (const row of account.vectorizeV2QueriesAdaptiveGroups || []) {
+					const indexName = String(row?.dimensions?.indexName || "unknown");
+					const dims = Number(row?.sum?.queriedVectorDimensions || 0);
+					const cost = roundUsd(estimateRateCost(dims, 0.01));
+					if (cost > 0) cloudflareItems.push({ label: `${indexName} (Vectorize)`, amountUsd: cost });
+				}
+
+				const merged = new Map<string, number>();
+				for (const item of cloudflareItems) merged.set(item.label, roundUsd((merged.get(item.label) || 0) + item.amountUsd));
+				const items = [...merged.entries()].map(([label, amountUsd]) => ({ label, amountUsd })).sort((a, b) => b.amountUsd - a.amountUsd);
+				if (items.length > 0) sections.push({ title: "Cloudflare detailed", items });
+			}
+		}
+	}
+
+	if (sections.length === 0) {
+		sections.push({ title: "Recorded spend", items: [{ label: "Total", amountUsd: Number(state.spentUsd || 0) }] });
+	}
+
+	return { day, spentUsd: Number(state.spentUsd || 0), dailyLimitUsd: Number(state.dailyLimitUsd || 0), sections };
 }
 
 async function readConfig(): Promise<TelegramConfig> {
@@ -837,11 +1106,31 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		if (lower === "/spend") {
+			try {
+				const breakdown = await fetchSpendBreakdown();
+				const lines: string[] = [`Daily Spend Breakdown (${breakdown.day})`, ""];
+				for (const section of breakdown.sections) {
+					lines.push(`${section.title}:`);
+					for (const item of section.items) {
+						lines.push(`• ${item.label}: ${formatUsd(item.amountUsd)}`);
+					}
+					lines.push("");
+				}
+				lines.push(`Total: ${formatUsd(breakdown.spentUsd)} / $${breakdown.dailyLimitUsd.toFixed(2)}`);
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, lines.join("\n"));
+			} catch (e) {
+				const message = e instanceof Error ? e.message : String(e);
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Failed to fetch spend: ${message}`);
+			}
+			return;
+		}
+
 		if (lower === "/help" || lower === "/start") {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi. Commands: /status, /compact, stop.`,
+				`Send me a message and I will forward it to pi. Commands: /status, /spend, /compact, stop.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
@@ -1010,6 +1299,28 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("spend", {
+		description: "Show Budget Guard spend breakdown",
+		handler: async (_args, ctx) => {
+			try {
+				const breakdown = await fetchSpendBreakdown();
+				const theme = ctx.ui.theme;
+				const lines: string[] = [theme.fg("accent", `Daily Spend Breakdown (${breakdown.day})`)];
+				for (const section of breakdown.sections) {
+					lines.push(theme.fg("muted", section.title));
+					for (const item of section.items) {
+						lines.push(`  ${item.label}: ${formatUsd(item.amountUsd)}`);
+					}
+				}
+				lines.push(theme.fg("success", `Total: ${formatUsd(breakdown.spentUsd)} / $${breakdown.dailyLimitUsd.toFixed(2)}`));
+				ctx.ui.notify(lines.join("\n"), "info");
+			} catch (e) {
+				const message = e instanceof Error ? e.message : String(e);
+				ctx.ui.notify(`Failed to fetch spend: ${message}`, "error");
+			}
+		},
+	});
+
 	pi.registerCommand("telegram-setup", {
 		description: "Configure Telegram bot token",
 		handler: async (_args, ctx) => {
@@ -1127,6 +1438,61 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (assistant.stopReason === "error") {
 			await clearPreview(turn.chatId);
+			const errorMessage = assistant.errorMessage || "";
+			
+			// Check if this is a rate/usage limit error from any provider and retry hasn't been exceeded
+			const isUsageLimitError = /usage limit|rate limit|quota exceeded|overloaded|too many requests|throttled/i.test(errorMessage);
+			const retryCount = turn.usageLimitRetries ?? 0;
+			const MAX_USAGE_LIMIT_RETRIES = 3;
+			
+			if (isUsageLimitError && retryCount < MAX_USAGE_LIMIT_RETRIES && turn) {
+				// Store current model before cycling
+				const failedModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null;
+				
+				// Extract duration from error message (e.g., "~5656 min" or "1 hour")
+				const durationMatch = errorMessage.match(/~?(\d+(?:\.\d+)?\s*(?:min|minute|hour|hr|h|second|sec|s|day|d))/);
+				const durationMs = durationMatch ? parseDurationMs(durationMatch[0]) : 0;
+				
+				// Mark the current model as disabled for the specified duration
+				if (failedModel) {
+					disableModelUntil(failedModel.provider, failedModel.id, durationMs);
+				}
+				
+				// Cycle to the next model, skipping disabled ones
+				let newModel: { name?: string; id?: string; provider?: string } | undefined;
+				let cyclesAttempted = 0;
+				const MAX_CYCLES = 10; // Prevent infinite loops
+				
+				do {
+					const cycleResult = await ctx.worker.sendCommand("cycle_model", {});
+					newModel = cycleResult.data?.model as { name?: string; id?: string; provider?: string } | undefined;
+					cyclesAttempted++;
+					
+					if (!newModel || !isModelDisabled(newModel.provider, newModel.id)) {
+						break; // Found an enabled model
+					}
+				} while (cyclesAttempted < MAX_CYCLES);
+				
+				const modelName = newModel?.name ?? `${newModel?.provider}/${newModel?.id}`;
+				const disabledUntil = failedModel ? getDisabledTimeRemaining(failedModel.provider, failedModel.id) : 0;
+				const timeStr = disabledUntil > 0 ? ` (unavailable for ${disabledUntil}s)` : "";
+				
+				// Notify user of the cycle and retry
+				await sendTextReply(
+					turn.chatId,
+					turn.replyToMessageId,
+					`Rate limit hit${timeStr}. Cycling to ${modelName}... retrying.`
+				);
+				
+				// Re-queue the turn for retry with incremented counter
+				turn.usageLimitRetries = retryCount + 1;
+				queuedTelegramTurns.unshift(turn);
+				if (queuedTelegramTurns.length === 1) {
+					pi.sendUserMessage(turn.content);
+				}
+				return;
+			}
+			
 			await sendTextReply(turn.chatId, turn.replyToMessageId, assistant.errorMessage || "Telegram bridge: pi failed while processing the request.");
 			return;
 		}
